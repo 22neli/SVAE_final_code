@@ -1,3 +1,32 @@
+# Hyperspherical Variational Auto-Encoders (Extended)
+
+**Important note**  
+This repository is **derived from** the original PyTorch implementation of  
+**Hyperspherical Variational Auto-Encoders** by Davidson et al. (2018),  
+available at: https://github.com/nicola-decao/s-vae-pytorch.
+
+The original authors retain full credit for the core model, distributions,
+and sampling procedures.  
+
+
+### What was added in this repository
+- Extended training and evaluation scripts
+- Systematic latent-dimension and seed sweeps
+- Instrumentation of the von Mises–Fisher rejection sampler
+  (κ statistics, attempts, timing)
+- κ-clipping and temperature stress experiments
+- Analysis and plotting utilities for ELBO, LL, sampler cost,
+  and latent usage diagnostics
+
+---
+
+### Original authors and implementation
+**Tim R. Davidson, Luca Falorsi, Nicola De Cao, Thomas Kipf, Jakub M. Tomczak**  
+Paper: *Hyperspherical Variational Auto-Encoders* (UAI 2018)
+
+Original repository:  
+https://github.com/nicola-decao/s-vae-pytorch
+
 # Hyperspherical Variational Auto-Encoders
 ### Pytorch implementation of Hyperspherical Variational Auto-Encoders
 
