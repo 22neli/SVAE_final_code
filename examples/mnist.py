@@ -53,7 +53,7 @@ def set_seed(seed=0):
 
 
 
-# Data loaders (globals; rebuilt per run_one)
+# Data loaders (rebuilt per run_one)
 
 train_loader = None
 test_loader = None
@@ -112,7 +112,7 @@ class ModelVAE(nn.Module):
             T = max(1e-8, float(self.kappa_temp))
             z_var = z_var / T
 
-            # κ-clipping intervention (encode-time)
+            # κ-clipping intervention 
             if self.kappa_clip is not None:
                 z_var = torch.clamp(z_var, max=float(self.kappa_clip))
 
@@ -408,7 +408,7 @@ def run_one(config, out_csv):
     else:
         model = ModelVAE(
             h_dim=H_DIM,
-            z_dim=z_dim + 1,  # your vMF uses Z_DIM+1
+            z_dim=z_dim + 1,  # our vMF uses Z_DIM+1
             distribution="vmf",
             kappa_clip=config.get("kappa_clip", None),
             kappa_temp=config.get("kappa_temp", 1.0),
