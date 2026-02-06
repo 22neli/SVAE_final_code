@@ -20,7 +20,7 @@ OUT_APPX   = OUT_DIR / "appendix"
 for d in [OUT_DIR, OUT_MAIN, OUT_STRESS, OUT_DIAG, OUT_APPX]:
     d.mkdir(exist_ok=True)
 
-MAIN_DATASET = "mnist"      # set to "fashionmnist" if we want ALL main plots on FashionMNIST
+MAIN_DATASET = "mnist"      # set to "fashionmnist" otherwise
 Z_STRESS     = 20
 
 
@@ -34,12 +34,10 @@ Main-paper figures are selected from this full set.
 """
 
 
-# Publication-style tuning 
-
 # Mean curves (main lines)
 LW_MEAN = 1.7
 MS_MEAN = 3.8
-# Prettier dashed lines for vMF (longer, calmer than "--")
+# Prettier dashed lines for vMF 
 VMF_DASH = (0, (10, 4))   
 
 MARKEVERY_MEAN = 1 
