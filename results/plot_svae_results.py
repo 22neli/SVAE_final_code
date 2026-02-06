@@ -3,12 +3,28 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from pathlib import Path
+from matplotlib.ticker import MultipleLocator, LogLocator, NullFormatter
+import matplotlib.cm as cm
 
+# ============================================================
+# Paths / config
+# ============================================================
 BASE_DIR = Path(__file__).resolve().parent
 CSV_PATH = BASE_DIR / "results_svae_sweep.csv"
-OUT_DIR = BASE_DIR / "plots_svae"
-OUT_DIR.mkdir(exist_ok=True)
 
+OUT_DIR    = BASE_DIR / "plots_svae"
+OUT_MAIN   = OUT_DIR / "main"
+OUT_STRESS = OUT_DIR / "stress"
+OUT_DIAG   = OUT_DIR / "diagnostics"
+OUT_APPX   = OUT_DIR / "appendix"
+for d in [OUT_DIR, OUT_MAIN, OUT_STRESS, OUT_DIAG, OUT_APPX]:
+    d.mkdir(exist_ok=True)
+
+MAIN_DATASET = "mnist"      # set to "fashionmnist" if we want ALL main plots on FashionMNIST
+Z_STRESS     = 20
+
+
+BATCH_SIZE = 64
 
 """
 NOTE:
@@ -17,14 +33,63 @@ Additional figures serve as diagnostics, robustness checks, and appendix materia
 Main-paper figures are selected from this full set.
 """
 
-# Helpers
 
-def savefig(name):
-    path = OUT_DIR / name
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
-    plt.close()
-    print("Saved:", path)
+# Publication-style tuning 
+
+# Mean curves (main lines)
+LW_MEAN = 1.7
+MS_MEAN = 3.8
+# Prettier dashed lines for vMF (longer, calmer than "--")
+VMF_DASH = (0, (10, 4))   
+
+MARKEVERY_MEAN = 1 
+
+# Seed curves (thin, very light)
+LW_SEED = 0.8
+MS_SEED = 2.0
+MARKEVERY_SEED = 3
+ALPHA_SEED = 0.13
+plt.rcParams["lines.dash_capstyle"] = "round"
+plt.rcParams["lines.solid_capstyle"] = "round"
+plt.rcParams["lines.dash_joinstyle"] = "round"
+plt.rcParams["lines.solid_joinstyle"] = "round"
+
+# Labels (no underscores; explain averages in title, not "(mean)")
+
+YLABEL = {
+    "ELBO": "ELBO",
+    "LL": "Log-likelihood (MC estimate)",
+    "train_seconds_per_batch": "Seconds per batch",
+    "runtime_ms": "Milliseconds per batch",
+    "Delta_sigmoid": "Δ (sigmoid output)",
+    "KL_per_dim": "KL per latent dimension",
+    "accept_rate_mean": "Acceptance rate",
+    "attempts_mean": "Attempts (mean)",
+    "attempts_p90": "Attempts (p90)",
+    "attempts_max": "Attempts (max)",
+    "kappa_obs_mean": "κ",
+    "kappa_obs_p90": "κ (p90)",
+    "kappa_obs_max": "κ (max)",
+}
+
+
+# Colors: keep “light -> dark with increasing z”, but avoid too-pale hues
+
+def _palette_from_cmap(cmap_name: str, n: int, lo: float = 0.45, hi: float = 0.92):
+    """
+    Sample n colors from a colormap (lo->hi).
+    lo>=0.45 avoids near-white tones that wash out on slides/projectors.
+    """
+    cmap = cm.get_cmap(cmap_name)
+    xs = np.linspace(lo, hi, n)
+    return [cmap(x) for x in xs]
+
+# z dims assumed {5,10,20} -> 3 shades
+NORMAL_COLORS = _palette_from_cmap("Blues",   3, lo=0.48, hi=0.92)
+VMF_COLORS    = _palette_from_cmap("Oranges", 3, lo=0.48, hi=0.95)
+
+
+# Cleaning helpers
 
 def _clean_kclip(x):
     if pd.isna(x):
@@ -53,42 +118,238 @@ def _clean_temp(x):
     except Exception:
         return 1.0
 
+
+# Plot style helpers 
+
+def _format_epoch_axis(ax, max_epoch: int):
+    # Discrete epochs: majors every 5, minors every 1 
+    ax.set_xlim(1, max_epoch)
+    ax.xaxis.set_major_locator(MultipleLocator(5))
+    ax.xaxis.set_minor_locator(MultipleLocator(1))
+    ax.grid(True, which="major", axis="x", alpha=0.22)
+    ax.grid(True, which="minor", axis="x", alpha=0.10)
+
+def _format_y_grid(ax, logy: bool):
+    ax.grid(True, which="major", axis="y", alpha=0.18)
+    if logy:
+        ax.yaxis.set_minor_locator(LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+        ax.grid(False, which="minor", axis="y")
+
+def _apply_style(ax, max_epoch: int, logy: bool):
+    if logy:
+        ax.set_yscale("log")
+    _format_epoch_axis(ax, max_epoch)
+    _format_y_grid(ax, logy)
+
+def _savefig(path: Path):
+    plt.tight_layout()
+    plt.savefig(path, dpi=240)
+    plt.close()
+    print("Saved:", path)
+
 def mean_over_seeds(df, group_cols, value_cols):
     return df.groupby(group_cols + ["epoch"], as_index=False)[value_cols].mean()
 
-def plot_seed_lines_plus_mean(
-    df, group_key, x="epoch", y="ELBO", title="", xlabel="epoch", ylabel=None,
-    legend_title=None, logy=False, fname="plot.png"
-):
-    fig, ax = plt.subplots()
-    if logy:
-        ax.set_yscale("log")
 
-    # thin seed lines to check if effect is consistent
+# Consistent encoding: Normal vs vMF 
+
+# Normal = solid + circles, vMF = dashed + triangles
+MODEL_STYLE = {
+    "normal": {"marker": "o"},
+    "vmf":    {"marker": "^"},
+}
+
+def _z_color_map(unique_z_sorted, model_type: str):
+    pal = NORMAL_COLORS if model_type == "normal" else VMF_COLORS
+    return {z: pal[i % len(pal)] for i, z in enumerate(unique_z_sorted)}
+
+# Stress overlays: keep vMF marker "^" always, encode intervention type with linestyle
+# Pretty dash patterns for stress/appendix settings
+BASE_LINE = "-"                 # baseline: solid
+CLIP_DASH = (0, (10, 4, 2, 4))  # clip: dash–dot
+TEMP_DASH = (0, (1, 3))         # temp: dotted
+
+
+def _stress_linestyle(setting: str):
+    # baseline vs clip vs temperature 
+    if "clip =" in setting and "clip = None" not in setting:
+        return CLIP_DASH  # clipping
+    if "T =" in setting and "T = 1.0" not in setting:
+        return TEMP_DASH    # temperature scaling
+    return BASE_LINE      # baseline
+
+def _plot_mean_curves(ax, mean_df, group_key, y, label_fn, model_type=None):
+    """
+    mean_df must have columns: epoch, group_key, y
+    model_type selects marker; linestyle set here by model type (solid vs dashed).
+    """
+    if len(mean_df) == 0:
+        return
+
+    marker = MODEL_STYLE.get(model_type, {"marker": "o"})["marker"]
+    ls = "-" if model_type == "normal" else VMF_DASH
+    groups_sorted = sorted(mean_df[group_key].unique().tolist())
+    color_map = _z_color_map(groups_sorted, model_type=model_type)
+
+    for gval, g in mean_df.groupby(group_key):
+        g = g.sort_values("epoch")
+        ax.plot(
+            g["epoch"], g[y],
+            linestyle=ls,
+            marker=marker,
+            markersize=MS_MEAN,
+            markevery=MARKEVERY_MEAN,
+            linewidth=LW_MEAN,
+            color=color_map.get(gval, None),
+            label=label_fn(gval),
+        )
+
+def _plot_seed_lines_plus_mean(
+    df, group_key, y, title, out_path, logy=False, ylabel=None, mean_model_type=None
+):
+    if len(df) == 0 or y not in df.columns:
+        return
+
+    max_epoch = int(df["epoch"].max())
+    fig, ax = plt.subplots()
+
+    marker = MODEL_STYLE.get(mean_model_type, {"marker": "o"})["marker"]
+    ls = "-" if mean_model_type == "normal" else VMF_DASH
+    groups_sorted = sorted(df[group_key].unique().tolist())
+    color_map = _z_color_map(groups_sorted, model_type=mean_model_type)
+
+    # thin seed lines
     for gval, g in df.groupby(group_key):
         for seed, gs in g.groupby("seed"):
-            gs = gs.sort_values(x)
-            ax.plot(gs[x], gs[y], alpha=0.35, linewidth=1)
+            gs = gs.sort_values("epoch")
+            ax.plot(
+                gs["epoch"], gs[y],
+                linestyle=ls,
+                marker=marker,
+                markersize=MS_SEED,
+                markevery=MARKEVERY_SEED,
+                linewidth=LW_SEED,
+                alpha=ALPHA_SEED,
+                color=color_map.get(gval, None),
+            )
 
-    # thick mean lines 
-    mean_df = df.groupby([group_key, x], as_index=False)[y].mean()
-    for gval, gm in mean_df.groupby(group_key):
-        gm = gm.sort_values(x)
-        ax.plot(gm[x], gm[y], linewidth=2.5, label=f"{group_key}={gval}")
+    # mean line
+    mean_df = df.groupby([group_key, "epoch"], as_index=False)[y].mean()
+    _plot_mean_curves(
+        ax, mean_df, group_key, y,
+        label_fn=lambda gval: f"{group_key} = {gval}",
+        model_type=mean_model_type,
+    )
 
     ax.set_title(title)
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel or y)
-    ax.legend(title=legend_title) if legend_title else ax.legend()
-    savefig(fname)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel or YLABEL.get(y, y.replace("_", " ")))
+    _apply_style(ax, max_epoch=max_epoch, logy=logy)
+    ax.legend()
+    _savefig(out_path)
 
-def final_epoch_summary_bar(df, group_col, metrics, title, fname, sort_by=None):
-    last_ep = df["epoch"].max()
+def _plot_stress_overlay(
+    stress_df, y, title, out_path, logy=False, show_seed_lines=True, ylabel=None
+):
+    if len(stress_df) == 0 or y not in stress_df.columns:
+        return
+
+    max_epoch = int(stress_df["epoch"].max())
+    fig, ax = plt.subplots()
+
+    marker = MODEL_STYLE["vmf"]["marker"]
+
+    # seed lines (light)
+    if show_seed_lines:
+        for setting, g in stress_df.groupby("setting"):
+            ls = _stress_linestyle(setting)
+            for seed, gs in g.groupby("seed"):
+                gs = gs.sort_values("epoch")
+                ax.plot(
+                    gs["epoch"], gs[y],
+                    linestyle=ls,
+                    marker=marker,
+                    markersize=MS_SEED,
+                    markevery=MARKEVERY_SEED,
+                    linewidth=LW_SEED,
+                    alpha=ALPHA_SEED,
+                )
+
+    # mean curves
+    mean_df = stress_df.groupby(["setting", "epoch"], as_index=False)[y].mean()
+    settings_sorted = sorted(mean_df["setting"].unique())
+    palette = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    color_map = {s: palette[i % len(palette)] for i, s in enumerate(settings_sorted)}
+
+    for setting, gm in mean_df.groupby("setting"):
+        gm = gm.sort_values("epoch")
+        ls = _stress_linestyle(setting)
+        ax.plot(
+            gm["epoch"], gm[y],
+            linestyle=ls,
+            marker=marker,
+            markersize=MS_MEAN,
+            markevery=MARKEVERY_MEAN,
+            linewidth=max(LW_MEAN, 1.8),
+            color=color_map[setting],
+            label=setting,
+        )
+
+    ax.set_title(title)
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel or YLABEL.get(y, y.replace("_", " ")))
+    _apply_style(ax, max_epoch=max_epoch, logy=logy)
+
+    # Legend ordering: baseline first, then clipping, then temperature
+    handles, labels = ax.get_legend_handles_labels()
+
+    def _legend_key(label):
+        if "clip = None, T = 1.0" in label:
+            return 0
+        if "clip =" in label:
+            return 1
+        if "T =" in label:
+            return 2
+        return 3
+
+    order = sorted(range(len(labels)), key=lambda i: _legend_key(labels[i]))
+    ax.legend([handles[i] for i in order], [labels[i] for i in order], fontsize=9)
+
+    _savefig(out_path)
+
+def _plot_scatter(df, x, y, title, out_path, logx=False, logy=False, xlabel=None, ylabel=None):
+    # markers only; do NOT connect points.
+    if len(df) == 0 or x not in df.columns or y not in df.columns:
+        return
+    fig, ax = plt.subplots()
+    if logx:
+        ax.set_xscale("log")
+    if logy:
+        ax.set_yscale("log")
+    ax.scatter(df[x], df[y], alpha=0.40, s=24, marker="o")
+    ax.set_title(title)
+    ax.set_xlabel(xlabel or x.replace("_", " "))
+    ax.set_ylabel(ylabel or y.replace("_", " "))
+    ax.grid(True, which="major", alpha=0.18)
+    _savefig(out_path)
+
+def _final_epoch_summary_bar(df, group_col, metrics, title, out_prefix, sort_by=None):
+    if len(df) == 0:
+        return
+
+    last_ep = int(df["epoch"].max())
     d = df[df["epoch"] == last_ep].copy()
+    if len(d) == 0:
+        return
 
-    agg = d.groupby([group_col, "seed"], as_index=False)[metrics].mean()
-    mean = agg.groupby(group_col, as_index=False)[metrics].mean()
-    std  = agg.groupby(group_col, as_index=False)[metrics].std(ddof=0)
+    keep_metrics = [m for m in metrics if m in d.columns]
+    if not keep_metrics:
+        return
+
+    per_seed = d.groupby([group_col, "seed"], as_index=False)[keep_metrics].mean()
+    mean = per_seed.groupby(group_col, as_index=False)[keep_metrics].mean()
+    std  = per_seed.groupby(group_col, as_index=False)[keep_metrics].std(ddof=0)
 
     if sort_by is not None and sort_by in mean.columns:
         order = mean.sort_values(sort_by)[group_col].tolist()
@@ -97,416 +358,403 @@ def final_epoch_summary_bar(df, group_col, metrics, title, fname, sort_by=None):
         mean = mean.sort_values(group_col)
         std  = std.sort_values(group_col)
 
-    for m in metrics:
+    for m in keep_metrics:
         fig, ax = plt.subplots()
         xlabels = mean[group_col].astype(str).tolist()
         x = np.arange(len(xlabels))
         ax.bar(x, mean[m].values, yerr=std[m].values, capsize=4)
         ax.set_xticks(x)
         ax.set_xticklabels(xlabels, rotation=25, ha="right")
-        ax.set_title(f"{title}\n(final epoch: {last_ep}) — {m}")
-        ax.set_ylabel(m)
-        savefig(fname.replace(".png", f"_{m}.png"))
+        ax.set_title(f"{title}\nFinal epoch = {last_ep} (mean ± std over seeds)")
 
-# stress overlay plot (baseline + temp + clip on the same plot)
-def plot_stress_overlay(stress_df, y, title, fname, logy=False, show_seed_lines=True):
-    fig, ax = plt.subplots()
-    if logy:
-        ax.set_yscale("log")
+        ax.set_ylabel(YLABEL.get(m, m.replace("_", " ")))
+        ax.grid(True, which="major", axis="y", alpha=0.18)
+        _savefig(out_prefix.with_name(out_prefix.name + f"_{m}.png"))
 
-    # optional thin seed lines
-    if show_seed_lines:
-        for setting, g in stress_df.groupby("setting"):
-            for seed, gs in g.groupby("seed"):
-                gs = gs.sort_values("epoch")
-                ax.plot(gs["epoch"], gs[y], alpha=0.20, linewidth=1)
-
-    # thick mean lines (mean over seeds)
-    mean_df = stress_df.groupby(["setting", "epoch"], as_index=False)[y].mean()
-    for setting, gm in mean_df.groupby("setting"):
-        gm = gm.sort_values("epoch")
-        ax.plot(gm["epoch"], gm[y], linewidth=2.5, label=setting)
-
-    ax.set_title(title)
-    ax.set_xlabel("epoch")
-    ax.set_ylabel(y)
-    ax.legend()
-    savefig(fname)
-
-# stress scatter (mechanism link) y vs x with mean point per epoch (or all points)
-def plot_scatter(stress_df, x, y, title, fname, logx=False, logy=False):
-    fig, ax = plt.subplots()
-    if logx:
-        ax.set_xscale("log")
-    if logy:
-        ax.set_yscale("log")
-
-    ax.scatter(stress_df[x], stress_df[y], alpha=0.35, s=18)
-    ax.set_title(title)
-    ax.set_xlabel(x)
-    ax.set_ylabel(y)
-    savefig(fname)
 
 # Load + preprocess
+
 df = pd.read_csv(CSV_PATH)
 
-# Guard against missing columns
-for col in ["kappa_clip", "kappa_temp"]:
+# ensure columns exist
+for col in ["kappa_clip", "kappa_temp", "dataset", "model_type"]:
     if col not in df.columns:
         df[col] = np.nan
 
 df["kappa_clip"] = df["kappa_clip"].apply(_clean_kclip)
 df["kappa_temp"] = df["kappa_temp"].apply(_clean_temp)
 
-print("Unique kappa_clip:", sorted(df["kappa_clip"].dropna().unique()))
-print("Unique kappa_temp:", sorted(pd.Series(df["kappa_temp"].dropna().unique()).tolist()))
+# dtypes (avoid sorting/grouping weirdness)
+df["model_type"] = df["model_type"].astype(str).str.lower()
+df["dataset"] = df["dataset"].astype(str).str.lower()
+for col in ["z_dim", "z_dim_effective", "seed", "epoch"]:
+    if col in df.columns:
+        df[col] = df[col].astype(int)
 
-# enforce dtypes
-df["model_type"] = df["model_type"].astype(str)
-df["z_dim"] = df["z_dim"].astype(int)
-df["z_dim_effective"] = df["z_dim_effective"].astype(int)
-df["seed"] = df["seed"].astype(int)
-df["epoch"] = df["epoch"].astype(int)
+print("Datasets:", sorted(df["dataset"].unique()))
+print("kappa_clip:", sorted(df["kappa_clip"].dropna().unique()))
+print("kappa_temp:", sorted(pd.Series(df["kappa_temp"].dropna().unique()).tolist()))
 
-df_normal = df[df["model_type"] == "normal"].copy()
-df_vmf    = df[df["model_type"] == "vmf"].copy()
 
-# baseline = no clip + T=1.0
+# Split: all vs main dataset
+
+df_normal_all = df[df["model_type"] == "normal"].copy()
+df_vmf_all    = df[df["model_type"] == "vmf"].copy()
+
+df_main   = df[df["dataset"] == MAIN_DATASET].copy()
+df_normal = df_main[df_main["model_type"] == "normal"].copy()
+df_vmf    = df_main[df_main["model_type"] == "vmf"].copy()
+
+# baseline vMF: no clip + T=1.0 (within MAIN dataset only)
 vmf_base = df_vmf[(df_vmf["kappa_clip"] == "None") & (df_vmf["kappa_temp"] == 1.0)].copy()
 
+seeds_present = sorted(df_main["seed"].unique().tolist()) if len(df_main) and "seed" in df_main.columns else []
+seed_note = f"Averaged over seeds {seeds_present}" if seeds_present else "Averaged over seeds"
 
-# ELBO: Normal vs vMF baseline
-
+# Metric sets (only keep columns that exist)
 value_cols_common = ["ELBO", "LL", "train_seconds_per_batch", "Delta_sigmoid", "KL_per_dim"]
 value_cols_vmf = value_cols_common + [
     "accept_rate_mean",
-    "attempts_p90", "attempts_max",
+    "attempts_mean", "attempts_p90", "attempts_max",
     "kappa_obs_mean", "kappa_obs_p90", "kappa_obs_max",
 ]
 
-normal_mean = mean_over_seeds(df_normal, ["z_dim"], value_cols_common)
-vmf_mean    = mean_over_seeds(vmf_base,  ["z_dim"], value_cols_vmf)
+common_cols_present = [c for c in value_cols_common if c in df.columns]
+vmf_cols_present    = [c for c in value_cols_vmf if c in df.columns]
 
-fig, ax = plt.subplots()
-for z, g in normal_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["ELBO"], label=f"Normal z={z}")
-for z, g in vmf_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["ELBO"], label=f"vMF z={z} (eff={z+1})")
-ax.set_title("ELBO vs epoch (Normal vs vMF baseline)")
-ax.set_xlabel("epoch")
-ax.set_ylabel("ELBO")
-ax.legend()
-savefig("01_ELBO_normal_vs_vmf.png")
+# MAIN plots: Normal vs vMF baseline (mean over seeds)
+normal_mean = mean_over_seeds(
+    df_normal, ["z_dim"], [c for c in common_cols_present if c in df_normal.columns]
+) if len(df_normal) else pd.DataFrame()
+
+vmf_mean = mean_over_seeds(
+    vmf_base, ["z_dim"], [c for c in vmf_cols_present if c in vmf_base.columns]
+) if len(vmf_base) else pd.DataFrame()
+
+max_epoch_main = int(df_main["epoch"].max()) if len(df_main) else 1
 
 
-# LL: Normal vs vMF baseline
-
-fig, ax = plt.subplots()
-for z, g in normal_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["LL"], label=f"Normal z={z}")
-for z, g in vmf_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["LL"], label=f"vMF z={z} (eff={z+1})")
-ax.set_title("MC log-likelihood vs epoch (Normal vs vMF baseline)")
-ax.set_xlabel("epoch")
-ax.set_ylabel("LL (MC estimate)")
-ax.legend()
-savefig("02_LL_normal_vs_vmf.png")
-
-
-# κ dynamics (baseline)
-
-plot_seed_lines_plus_mean(
-    vmf_base, group_key="z_dim", y="kappa_obs_mean",
-    title="κ mean over epochs (vMF baseline) — seed lines + mean",
-    ylabel="κ (mean)", logy=True,
-    fname="03a_kappa_mean_seed_plus_mean_log.png",
-)
-
-plot_seed_lines_plus_mean(
-    vmf_base, group_key="z_dim", y="kappa_obs_max",
-    title="κ max over epochs (vMF baseline) — seed lines + mean (tail!)",
-    ylabel="κ (max)", logy=True,
-    fname="03b_kappa_max_seed_plus_mean_log.png",
-)
-
-
-# Attempts tail (baseline)
-
-plot_seed_lines_plus_mean(
-    vmf_base, group_key="z_dim", y="attempts_p90",
-    title="Sampling attempts p90 over epochs (vMF baseline)",
-    ylabel="attempts_p90", logy=True,
-    fname="04a_attempts_p90_seed_plus_mean_log.png",
-)
-
-plot_seed_lines_plus_mean(
-    vmf_base, group_key="z_dim", y="attempts_max",
-    title="Sampling attempts MAX over epochs (vMF baseline) — tail behavior",
-    ylabel="attempts_max", logy=True,
-    fname="04b_attempts_max_seed_plus_mean_log.png",
-)
-
-
-# Time per batch : Normal vs vMF baseline
-
-fig, ax = plt.subplots()
-for z, g in normal_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["train_seconds_per_batch"], label=f"Normal z={z}")
-for z, g in vmf_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["train_seconds_per_batch"], label=f"vMF z={z}")
-ax.set_title("Training cost: seconds per batch (Normal vs vMF baseline)")
-ax.set_xlabel("epoch")
-ax.set_ylabel("sec/batch")
-ax.legend()
-savefig("05_time_per_batch.png")
-
-
-# Delta_sigmoid : Normal vs vMF baseline
-
-fig, ax = plt.subplots()
-for z, g in normal_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["Delta_sigmoid"], label=f"Normal z={z}")
-for z, g in vmf_mean.groupby("z_dim"):
-    g = g.sort_values("epoch")
-    ax.plot(g["epoch"], g["Delta_sigmoid"], label=f"vMF z={z} (eff={z+1})")
-ax.set_title("Δ (posterior resampling sensitivity) vs epoch — Normal vs vMF baseline")
-ax.set_xlabel("epoch")
-ax.set_ylabel("Delta_sigmoid")
-ax.legend()
-savefig("06_delta_sigmoid_normal_vs_vmf.png")
-
-
-
-
-fig, ax = plt.subplots()
-g = vmf_mean[vmf_mean["z_dim"] == 20].sort_values("epoch")
-ax.plot(g["epoch"], g["Delta_sigmoid"], label="vMF z=20", linewidth=2.5)
-ax.set_title("Δ sigmoid over epoch — vMF z=20")
-ax.set_xlabel("epoch")
-ax.set_ylabel("Δ sigmoid")
-ax.legend()
-savefig("delta_zoom_vmf_z20.png")
-
-
-
-# Stress setting (z=20): temperature + clipping (same plot)
-
-stress = df_vmf[df_vmf["z_dim"] == 20].copy()
-
-def setting_label(r):
-    clip = r["kappa_clip"]
-    T = float(r["kappa_temp"])
-    if clip != "None":
-        return f"clip={clip},T=1.0"
-    return f"clip=None,T={T:.1f}"
-
-stress["setting"] = stress.apply(setting_label, axis=1)
-
-keep_settings = [
-    "clip=None,T=1.0",
-    "clip=50,T=1.0",
-    "clip=100,T=1.0",
-    "clip=None,T=0.5",
-    "clip=None,T=2.0",
-]
-stress = stress[stress["setting"].isin(keep_settings)].copy()
-
-print("Stress settings present:", sorted(stress["setting"].unique()))
-print("Rows per setting:\n", stress["setting"].value_counts())
-
-# same plot: (mean-over-seeds) 
-plot_stress_overlay(
-    stress, y="kappa_obs_mean",
-    title="Stress z=20: κ mean — baseline vs temperature vs clipping",
-    fname="S1_stress_overlay_kappa_mean_log.png",
-    logy=True,
-    show_seed_lines=True
-)
-
-plot_stress_overlay(
-    stress, y="attempts_p90",
-    title="Stress z=20: attempts p90 — baseline vs temperature vs clipping",
-    fname="S2_stress_overlay_attempts_p90_log.png",
-    logy=True,
-    show_seed_lines=True
-)
-
-plot_stress_overlay(
-    stress, y="train_seconds_per_batch",
-    title="Stress z=20: seconds/batch — baseline vs temperature vs clipping",
-    fname="S3_stress_overlay_seconds_per_batch.png",
-    logy=False,
-    show_seed_lines=True
-)
-
-plot_stress_overlay(
-    stress, y="Delta_sigmoid",
-    title="Stress z=20: Δsigmoid — baseline vs temperature vs clipping",
-    fname="S4_stress_overlay_delta_sigmoid.png",
-    logy=False,
-    show_seed_lines=True
-)
-
-# Optional: we could also show κ p90 (stronger than mean)
-if "kappa_obs_p90" in stress.columns:
-    plot_stress_overlay(
-        stress, y="kappa_obs_p90",
-        title="Stress z=20: κ p90 — baseline vs temperature vs clipping",
-        fname="S1b_stress_overlay_kappa_p90_log.png",
-        logy=True,
-        show_seed_lines=True
+# 0) ELBO + LL together (shared y-axis) — like appendix style
+if (
+    len(normal_mean) and len(vmf_mean)
+    and "ELBO" in normal_mean.columns and "ELBO" in vmf_mean.columns
+    and "LL"   in normal_mean.columns and "LL"   in vmf_mean.columns
+):
+    fig, (ax1, ax2) = plt.subplots(
+        1, 2, figsize=(11, 4), sharey=True, constrained_layout=True
     )
 
-# Final-epoch summaries (keep for appendix)
+    # --- Left: ELBO ---
+    _plot_mean_curves(
+        ax1, normal_mean, "z_dim", "ELBO",
+        label_fn=lambda z: f"Normal  z = {z}",
+        model_type="normal",
+    )
+    _plot_mean_curves(
+        ax1, vmf_mean, "z_dim", "ELBO",
+        label_fn=lambda z: f"vMF  z = {z} (eff = {z+1})",
+        model_type="vmf",
+    )
+    ax1.set_title("a) ELBO")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Metric value")
+    _apply_style(ax1, max_epoch=max_epoch_main, logy=False)
 
-final_epoch_summary_bar(
-    stress,
-    group_col="setting",
-    metrics=["attempts_max", "train_seconds_per_batch"],
-    title="Stress (z=20) — κ-clipping vs temperature (sampler tail + cost)",
-    fname="A1_stress_finalepoch_sampler_cost.png",
-    sort_by="attempts_max",
-)
+    # --- Right: LL ---
+    _plot_mean_curves(
+        ax2, normal_mean, "z_dim", "LL",
+        label_fn=lambda z: f"Normal  z = {z}",
+        model_type="normal",
+    )
+    _plot_mean_curves(
+        ax2, vmf_mean, "z_dim", "LL",
+        label_fn=lambda z: f"vMF  z = {z} (eff = {z+1})",
+        model_type="vmf",
+    )
+    ax2.set_title("b) MC log-likelihood")
+    ax2.set_xlabel("Epoch")
+    _apply_style(ax2, max_epoch=max_epoch_main, logy=False)
 
-final_epoch_summary_bar(
-    stress,
-    group_col="setting",
-    metrics=["Delta_sigmoid", "LL"],
-    title="Stress (z=20) — κ-clipping vs temperature (Δ + LL)",
-    fname="A2_stress_finalepoch_delta_ll.png",
-    sort_by="Delta_sigmoid",
-)
-
-
-# attempts_p90 vs κ_mean (mechanism link)
-plot_scatter(
-    stress, x="kappa_obs_mean", y="attempts_p90",
-    title="Stress z=20: attempts p90 vs κ mean (all epochs, all seeds)",
-    fname="X1_scatter_attempts_p90_vs_kappa_mean.png",
-    logx=True, logy=True
-)
-
-# time vs attempts_p90 (compute consequence)
-plot_scatter(
-    stress, x="attempts_p90", y="train_seconds_per_batch",
-    title="Stress z=20: seconds/batch vs attempts p90 (all epochs, all seeds)",
-    fname="X2_scatter_time_vs_attempts_p90.png",
-    logx=True, logy=False
-)
-
-# delta vs attempts_p90 (latent usage vs sampling pain)
-plot_scatter(
-    stress, x="attempts_p90", y="Delta_sigmoid",
-    title="Stress z=20: Δsigmoid vs attempts p90 (all epochs, all seeds)",
-    fname="X3_scatter_delta_vs_attempts_p90.png",
-    logx=True, logy=False
-)
-
-print("\nAll plots saved to:", OUT_DIR)
+    # One shared legend 
+    handles, labels = ax1.get_legend_handles_labels()
+    ax2.legend(
+        handles, labels,
+        loc="lower right",
+        fontsize=9,
+        frameon=True
+    )
 
 
-# Appendix: MNIST vs FashionMNIST (just as robustness check)
+    fig.suptitle(f"ELBO and MC log-likelihood over training — {MAIN_DATASET.upper()}\n{seed_note}")
 
-def make_setting(df):
-    def label_row(r):
-        clip = r["kappa_clip"]
-        T = float(r["kappa_temp"])
-        if clip != "None":
-            return f"clip={clip},T=1.0"
-        return f"clip=None,T={T:.1f}"
-    df = df.copy()
-    df["setting"] = df.apply(label_row, axis=1)
-    return df
+    out_path = OUT_MAIN / "00_ELBO_LL_shared_yaxis.png"
+    plt.savefig(out_path, dpi=240)
+    plt.close()
+    print("Saved:", out_path)
 
-keep_settings = {
-    "clip=None,T=1.0",
-    "clip=None,T=0.5",
-    "clip=None,T=2.0",
-    "clip=50,T=1.0",
-    "clip=100,T=1.0",
-}
 
-def plot_kappa_mnist_vs_fmnist(df_vmf, z=20, metric="kappa_obs_mean", fname="APPX_kappa_mnist_vs_fmnist.png"):
-    # filter to stress setting
-    d = df_vmf[df_vmf["z_dim"] == z].copy()
+# 1) ELBO
+if len(normal_mean) and "ELBO" in normal_mean.columns and len(vmf_mean) and "ELBO" in vmf_mean.columns:
+    fig, ax = plt.subplots()
+    _plot_mean_curves(
+        ax, normal_mean, "z_dim", "ELBO",
+        label_fn=lambda z: f"Normal  z = {z}",
+        model_type="normal",
+    )
+    _plot_mean_curves(
+        ax, vmf_mean, "z_dim", "ELBO",
+        label_fn=lambda z: f"vMF  z = {z} (eff = {z+1})",
+        model_type="vmf",
+    )
+    ax.set_title(f"ELBO over training — {MAIN_DATASET.upper()}\n{seed_note}")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel(YLABEL["ELBO"])
+    _apply_style(ax, max_epoch=max_epoch_main, logy=False)
+    ax.legend()
+    _savefig(OUT_MAIN / "01_ELBO_normal_vs_vmf.png")
 
-    # require dataset column
-    if "dataset" not in d.columns:
-        raise ValueError("CSV has no 'dataset' column. Add it during training or save MNIST/FMNIST to separate CSVs.")
+# 2) LL
+if len(normal_mean) and "LL" in normal_mean.columns and len(vmf_mean) and "LL" in vmf_mean.columns:
+    fig, ax = plt.subplots()
+    _plot_mean_curves(ax, normal_mean, "z_dim", "LL",
+                      label_fn=lambda z: f"Normal  z = {z}", model_type="normal")
+    _plot_mean_curves(ax, vmf_mean, "z_dim", "LL",
+                      label_fn=lambda z: f"vMF  z = {z} (eff = {z+1})", model_type="vmf")
+    ax.set_title(f"Monte Carlo log-likelihood over training — {MAIN_DATASET.upper()}\n{seed_note}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(YLABEL["LL"])
+    _apply_style(ax, max_epoch=max_epoch_main, logy=False)
+    ax.legend()
+    _savefig(OUT_MAIN / "02_LL_normal_vs_vmf.png")
 
-    d["dataset"] = d["dataset"].astype(str).str.lower()
-    d = make_setting(d)
-    d = d[d["setting"].isin(keep_settings)].copy()
+# 3) Runtime per batch (ms)
+if (
+    len(normal_mean) and len(vmf_mean)
+    and "train_seconds_per_batch" in normal_mean.columns
+    and "train_seconds_per_batch" in vmf_mean.columns
+):
+    normal_ms = normal_mean.copy()
+    vmf_ms = vmf_mean.copy()
+    normal_ms["runtime_ms"] = 1000.0 * normal_ms["train_seconds_per_batch"]
+    vmf_ms["runtime_ms"]    = 1000.0 * vmf_ms["train_seconds_per_batch"]
 
-    # mean over seeds for clean appendix plot
+    fig, ax = plt.subplots()
+    _plot_mean_curves(ax, normal_ms, "z_dim", "runtime_ms",
+                      label_fn=lambda z: f"Normal  z = {z}", model_type="normal")
+    _plot_mean_curves(ax, vmf_ms, "z_dim", "runtime_ms",
+                      label_fn=lambda z: f"vMF  z = {z}", model_type="vmf")
+
+    ax.set_title(
+        f"Runtime per batch (ms) over training — {MAIN_DATASET.upper()}\n"
+        f"{seed_note}; averaged over all training mini-batches per epoch; batch size = {BATCH_SIZE}"
+    )
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(YLABEL["runtime_ms"])
+    _apply_style(ax, max_epoch=max_epoch_main, logy=False)
+    ax.legend()
+    _savefig(OUT_MAIN / "03_runtime_ms_per_batch.png")
+
+# 4) Delta
+if (
+    len(normal_mean) and len(vmf_mean)
+    and "Delta_sigmoid" in normal_mean.columns
+    and "Delta_sigmoid" in vmf_mean.columns
+):
+    fig, ax = plt.subplots()
+    _plot_mean_curves(ax, normal_mean, "z_dim", "Delta_sigmoid",
+                      label_fn=lambda z: f"Normal  z = {z}", model_type="normal")
+    _plot_mean_curves(ax, vmf_mean, "z_dim", "Delta_sigmoid",
+                      label_fn=lambda z: f"vMF  z = {z} (eff = {z+1})", model_type="vmf")
+    ax.set_title(f"Latent usage diagnostic Δ over training — {MAIN_DATASET.upper()}\n{seed_note}")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(YLABEL["Delta_sigmoid"])
+    _apply_style(ax, max_epoch=max_epoch_main, logy=False)
+    ax.legend()
+    _savefig(OUT_MAIN / "04_delta_over_training.png")
+
+# Baseline vMF dynamics: seed lines + mean (with markers)
+# 
+if len(vmf_base):
+    _plot_seed_lines_plus_mean(
+        vmf_base, group_key="z_dim", y="kappa_obs_mean",
+        title=f"κ over training — vMF baseline, {MAIN_DATASET.upper()}\nThin: seeds; thick: mean",
+        out_path=OUT_MAIN / "05_kappa_mean_seed_plus_mean.png",
+        logy=True, ylabel=YLABEL["kappa_obs_mean"], mean_model_type="vmf",
+    )
+    _plot_seed_lines_plus_mean(
+        vmf_base, group_key="z_dim", y="kappa_obs_max",
+        title=f"κ (max) over training — vMF baseline, {MAIN_DATASET.upper()}\nThin: seeds; thick: mean",
+        out_path=OUT_MAIN / "06_kappa_max_seed_plus_mean.png",
+        logy=True, ylabel=YLABEL["kappa_obs_max"], mean_model_type="vmf",
+    )
+    _plot_seed_lines_plus_mean(
+        vmf_base, group_key="z_dim", y="attempts_p90",
+        title=f"Sampling attempts (p90) over training — vMF baseline, {MAIN_DATASET.upper()}\nThin: seeds; thick: mean",
+        out_path=OUT_MAIN / "07_attempts_p90_seed_plus_mean.png",
+        logy=True, ylabel=YLABEL["attempts_p90"], mean_model_type="vmf",
+    )
+    _plot_seed_lines_plus_mean(
+        vmf_base, group_key="z_dim", y="attempts_max",
+        title=f"Sampling attempts (max) over training — vMF baseline, {MAIN_DATASET.upper()}\nThin: seeds; thick: mean",
+        out_path=OUT_MAIN / "08_attempts_max_seed_plus_mean.png",
+        logy=True, ylabel=YLABEL["attempts_max"], mean_model_type="vmf",
+    )
+
+
+# Stress setting (z = Z_STRESS): overlay baseline vs clip vs temperature
+
+stress = df_vmf[df_vmf["z_dim"] == Z_STRESS].copy()
+
+def _setting_label(row):
+    clip = row["kappa_clip"]
+    T = float(row["kappa_temp"])
+    if clip != "None":
+        return f"clip = {clip}, T = 1.0"
+    return f"clip = None, T = {T:.1f}"
+
+if len(stress):
+    stress["setting"] = stress.apply(_setting_label, axis=1)
+
+    keep_settings = [
+        "clip = None, T = 1.0",
+        "clip = 50, T = 1.0",
+        "clip = 100, T = 1.0",
+        "clip = None, T = 0.5",
+        "clip = None, T = 2.0",
+    ]
+    stress = stress[stress["setting"].isin(keep_settings)].copy()
+
+    _plot_stress_overlay(
+        stress, y="kappa_obs_mean",
+        title=f"Stress z = {Z_STRESS}: κ over training — {MAIN_DATASET.upper()}\nThin: seeds; thick: mean",
+        out_path=OUT_STRESS / "S1_kappa_over_training.png",
+        logy=True, show_seed_lines=True, ylabel=YLABEL["kappa_obs_mean"]
+    )
+    _plot_stress_overlay(
+        stress, y="attempts_p90",
+        title=f"Stress z = {Z_STRESS}: sampling attempts (p90) over training — {MAIN_DATASET.upper()}\nThin: seeds; thick: mean",
+        out_path=OUT_STRESS / "S2_attempts_p90_over_training.png",
+        logy=True, show_seed_lines=True, ylabel=YLABEL["attempts_p90"]
+    )
+    _plot_stress_overlay(
+        stress, y="train_seconds_per_batch",
+        title=f"Stress z = {Z_STRESS}: Runtime per batch (s) over training over training — {MAIN_DATASET.upper()}\n{seed_note}; batch size = {BATCH_SIZE}",
+        out_path=OUT_STRESS / "S3_runtime_seconds_per_batch.png",
+        logy=False, show_seed_lines=True, ylabel=YLABEL["train_seconds_per_batch"]
+    )
+    _plot_stress_overlay(
+        stress, y="Delta_sigmoid",
+        title=f"Stress z = {Z_STRESS}: Δ over training — {MAIN_DATASET.upper()}\nThin: seeds; thick: mean",
+        out_path=OUT_STRESS / "S4_delta_over_training.png",
+        logy=False, show_seed_lines=True, ylabel=YLABEL["Delta_sigmoid"]
+    )
+
+    _final_epoch_summary_bar(
+        stress,
+        group_col="setting",
+        metrics=["attempts_max", "train_seconds_per_batch"],
+        title=f"Stress z = {Z_STRESS}: sampler tail and runtime — {MAIN_DATASET.upper()}",
+        out_prefix=OUT_STRESS / "S5_final_epoch_bars",
+        sort_by="attempts_max",
+    )
+
+    _final_epoch_summary_bar(
+        stress,
+        group_col="setting",
+        metrics=["Delta_sigmoid", "LL"],
+        title=f"Stress z = {Z_STRESS}: Δ and log-likelihood — {MAIN_DATASET.upper()}",
+        out_prefix=OUT_STRESS / "S6_final_epoch_bars",
+        sort_by="Delta_sigmoid",
+    )
+
+    _plot_scatter(
+        stress, x="kappa_obs_mean", y="attempts_p90",
+        title=f"Stress z = {Z_STRESS}: attempts (p90) vs κ — {MAIN_DATASET.upper()}",
+        out_path=OUT_DIAG / "X1_attempts_p90_vs_kappa.png",
+        logx=True, logy=True,
+        xlabel="κ", ylabel=YLABEL["attempts_p90"]
+    )
+    _plot_scatter(
+        stress, x="attempts_p90", y="train_seconds_per_batch",
+        title=f"Stress z = {Z_STRESS}: runtime vs attempts (p90) — {MAIN_DATASET.upper()}",
+        out_path=OUT_DIAG / "X2_runtime_vs_attempts_p90.png",
+        logx=True, logy=False,
+        xlabel=YLABEL["attempts_p90"], ylabel=YLABEL["train_seconds_per_batch"]
+    )
+    _plot_scatter(
+        stress, x="attempts_p90", y="Delta_sigmoid",
+        title=f"Stress z = {Z_STRESS}: Δ vs attempts (p90) — {MAIN_DATASET.upper()}",
+        out_path=OUT_DIAG / "X3_delta_vs_attempts_p90.png",
+        logx=True, logy=False,
+        xlabel=YLABEL["attempts_p90"], ylabel=YLABEL["Delta_sigmoid"]
+    )
+
+# Appendix for sure: MNIST vs FashionMNIST (shared y-axis; vMF identity preserved)
+
+def _make_setting(df_in):
+    df2 = df_in.copy()
+    df2["setting"] = df2.apply(_setting_label, axis=1)
+    return df2
+
+def plot_metric_mnist_vs_fmnist(df_vmf_all_in, z, metric, out_path, logy=True):
+    if metric not in df_vmf_all_in.columns:
+        return
+
+    d = df_vmf_all_in[df_vmf_all_in["z_dim"] == z].copy()
+    if len(d) == 0:
+        return
+    d = _make_setting(d)
+
+    keep = {
+        "clip = None, T = 1.0",
+        "clip = None, T = 0.5",
+        "clip = None, T = 2.0",
+        "clip = 50, T = 1.0",
+        "clip = 100, T = 1.0",
+    }
+    d = d[d["setting"].isin(keep)].copy()
+    if len(d) == 0:
+        return
+
     mean_df = d.groupby(["dataset", "setting", "epoch"], as_index=False)[metric].mean()
+    max_ep = int(mean_df["epoch"].max())
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4), sharey=True)
+    marker = MODEL_STYLE["vmf"]["marker"]
+
     for ax, ds in zip(axes, ["mnist", "fashionmnist"]):
         sub = mean_df[mean_df["dataset"] == ds].copy()
+        settings_sorted = sorted(sub["setting"].unique().tolist())
+        pal = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["tab:blue","tab:orange","tab:green","tab:red","tab:purple"])
+        cmap = {s: pal[i % len(pal)] for i, s in enumerate(settings_sorted)}
+
         for setting, g in sub.groupby("setting"):
             g = g.sort_values("epoch")
-            ax.plot(g["epoch"], g[metric], linewidth=2, label=setting)
+            ax.plot(
+                g["epoch"], g[metric],
+                linestyle=_stress_linestyle(setting),
+                marker=marker,
+                markersize=3.0,
+                markevery=MARKEVERY_MEAN,
+                linewidth=LW_MEAN,
+                color=cmap.get(setting, None),
+                label=setting,
+            )
+        prefix = "a) " if ds == "mnist" else "b) "
+        ax.set_title(prefix + ds.upper())
 
-        ax.set_title(ds.upper())
-        ax.set_xlabel("epoch")
-        ax.set_yscale("log")
-        ax.grid(True, which="both", alpha=0.25)
+        ax.set_xlabel("Epoch")
+        _apply_style(ax, max_epoch=max_ep, logy=logy)
 
-    axes[0].set_ylabel(metric)
+    axes[0].set_ylabel(YLABEL.get(metric, metric.replace("_", " ")))
     axes[1].legend(loc="best", fontsize=8, title="Setting")
-    plt.suptitle(f"Appendix: κ dynamics on MNIST vs FashionMNIST (vMF, z={z})")
-    savefig(fname)
+    plt.suptitle(f"Appendix: {YLABEL.get(metric, metric.replace('_',' '))} — MNIST vs FashionMNIST (vMF, z = {z})\n{seed_note}")
+    _savefig(out_path)
 
-# call it
-plot_kappa_mnist_vs_fmnist(df_vmf, z=20, metric="kappa_obs_mean", fname="APPX_kappa_mnist_vs_fmnist.png")
-
-
-# Standalone plot: Sampling attempts MEAN (vMF baseline)
-
-if "attempts_mean" not in vmf_base.columns:
-    raise ValueError("attempts_mean not found in CSV — cannot plot mean attempts.")
-
-fig, ax = plt.subplots()
-
-# thin seed lines
-for z, g in vmf_base.groupby("z_dim"):
-    for seed, gs in g.groupby("seed"):
-        gs = gs.sort_values("epoch")
-        ax.plot(
-            gs["epoch"],
-            gs["attempts_mean"],
-            alpha=0.30,
-            linewidth=1
-        )
-
-# thick mean-over-seeds line
-mean_df = (
-    vmf_base
-    .groupby(["z_dim", "epoch"], as_index=False)["attempts_mean"]
-    .mean()
+plot_metric_mnist_vs_fmnist(
+    df_vmf_all, z=Z_STRESS, metric="kappa_obs_mean",
+    out_path=OUT_APPX / "APPX_kappa_mean_mnist_vs_fmnist.png",
+    logy=True
 )
 
-for z, gm in mean_df.groupby("z_dim"):
-    gm = gm.sort_values("epoch")
-    ax.plot(
-        gm["epoch"],
-        gm["attempts_mean"],
-        linewidth=2.5,
-        label=f"z={z}"
-    )
-
-ax.set_title("Sampling attempts (MEAN) over epochs — vMF baseline")
-ax.set_xlabel("epoch")
-ax.set_ylabel("attempts_mean")
-ax.set_yscale("log")
-ax.legend()
-
-savefig("04c_attempts_mean_ONLY_seed_plus_mean_log.png")
+print("\nDone. Plots saved under:", OUT_DIR)

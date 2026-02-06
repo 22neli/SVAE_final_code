@@ -236,11 +236,18 @@ def train_one_epoch(model, optimizer):
         "train_seconds_per_batch": np.nan,
     }
 
+    # vMF logging (per batch, then averaged over batches for the epoch)
     vmf_accept = []
-    vmf_attempts = []
+
+    # per-sample attempts stats (computed inside VonMisesFisher.__while_loop)
+    vmf_attempts_mean = []
+    vmf_attempts_p90  = []
+    vmf_attempts_max  = []
+
+    # κ stats (per batch)
     vmf_kmean = []
-    vmf_kmax = []
     vmf_kp90 = []
+    vmf_kmax = []
 
     t0 = time.perf_counter()
     n_batches = 0
@@ -249,30 +256,42 @@ def train_one_epoch(model, optimizer):
         n_batches += 1
         optimizer.zero_grad()
 
-        # dynamic binarization (uses current torch RNG state)
+        # dynamic binarization
         x_mb = (x_mb > torch.rand_like(x_mb)).float()
 
         _, (q_z, p_z), _, x_logits = model(x_mb.reshape(-1, 784))
 
         if model.distribution == "vmf":
+            # acceptance rate (batch-level statistic)
             ar = getattr(q_z, "last_accept_rate", None)
-            ma = getattr(q_z, "last_mean_attempts", None)
+            if ar is not None:
+                vmf_accept.append(float(ar))
 
+            # TRUE per-sample attempts stats (within this batch)
+            am = getattr(q_z, "last_attempts_mean", None)
+            ap = getattr(q_z, "last_attempts_p90", None)
+            ax = getattr(q_z, "last_attempts_max", None)
+
+            if am is not None:
+                vmf_attempts_mean.append(float(am))
+            if ap is not None:
+                vmf_attempts_p90.append(float(ap))
+            if ax is not None:
+                vmf_attempts_max.append(float(ax))
+
+            # κ stats (per batch; already per-sample within batch)
             if hasattr(q_z, "scale"):
                 k = q_z.scale.detach()
                 vmf_kmean.append(float(k.mean().item()))
-                vmf_kmax.append(float(k.max().item()))
                 vmf_kp90.append(float(torch.quantile(k.reshape(-1), 0.90).item()))
+                vmf_kmax.append(float(k.max().item()))
 
-            if ar is not None:
-                vmf_accept.append(float(ar))
-            if ma is not None:
-                vmf_attempts.append(float(ma))
-
+        # reconstruction loss
         loss_recon = nn.BCEWithLogitsLoss(reduction="none")(
             x_logits, x_mb.reshape(-1, 784)
         ).sum(-1).mean()
 
+        # KL
         if model.distribution == "normal":
             loss_kl = torch.distributions.kl.kl_divergence(q_z, p_z).sum(-1).mean()
         else:
@@ -282,32 +301,36 @@ def train_one_epoch(model, optimizer):
         loss.backward()
         optimizer.step()
 
+    # epoch timing 
     dt = time.perf_counter() - t0
     out["train_epoch_seconds"] = float(dt)
     out["train_seconds_per_batch"] = float(dt / max(1, n_batches))
 
-    if model.distribution == "vmf" and len(vmf_attempts) > 0:
-        attempts = np.array(vmf_attempts, dtype=float)
-        out["attempts_mean"] = float(np.mean(attempts))
-        out["attempts_p90"] = float(np.percentile(attempts, 90))
-        out["attempts_max"] = float(np.max(attempts))
+    # aggregate vMF stats 
+    if model.distribution == "vmf" and len(vmf_attempts_mean) > 0:
+        # Epoch summaries = mean over batches of within-batch per-sample stats
+        out["attempts_mean"] = float(np.mean(vmf_attempts_mean))
+        out["attempts_p90"]  = float(np.mean(vmf_attempts_p90)) if len(vmf_attempts_p90) else np.nan
+        out["attempts_max"]  = float(np.mean(vmf_attempts_max)) if len(vmf_attempts_max) else np.nan
 
         if len(vmf_accept) > 0:
-            out["accept_rate_mean"] = float(np.mean(np.array(vmf_accept, dtype=float)))
+            out["accept_rate_mean"] = float(np.mean(vmf_accept))
 
         if len(vmf_kmean) > 0:
-            out["kappa_obs_mean"] = float(np.mean(np.array(vmf_kmean, dtype=float)))
+            out["kappa_obs_mean"] = float(np.mean(vmf_kmean))
         if len(vmf_kp90) > 0:
-            out["kappa_obs_p90"] = float(np.mean(np.array(vmf_kp90, dtype=float)))
+            out["kappa_obs_p90"] = float(np.mean(vmf_kp90))
         if len(vmf_kmax) > 0:
-            out["kappa_obs_max"] = float(np.max(np.array(vmf_kmax, dtype=float)))
+            out["kappa_obs_max"] = float(np.max(vmf_kmax))
 
-        if np.isfinite(out["attempts_mean"]) and out["attempts_mean"] > 0:
-            out["accept_est_from_attempts"] = float(1.0 / out["attempts_mean"])
-        if np.isfinite(out["accept_rate_mean"]) and np.isfinite(out["accept_est_from_attempts"]):
-            out["accept_gap"] = float(out["accept_rate_mean"] - out["accept_est_from_attempts"])
+        # acceptance estimate from attempts (E[tries] ≈ 1 / accept_prob)
+        out["accept_est_from_attempts"] = float(1.0 / out["attempts_mean"])
+        out["accept_gap"] = float(out["accept_rate_mean"] - out["accept_est_from_attempts"])
 
     return out
+
+
+
 
 
 
@@ -394,10 +417,15 @@ def run_one(config, out_csv):
     train_loader = make_loader(train_ds, batch_size=64, shuffle=True, generator=g)
     test_loader = make_loader(test_ds, batch_size=64, shuffle=False)
 
-    # fixed batch for Δ (rebuild per dataset; deterministic)
+# fixed batch for Δ (deterministic, without touching global RNG)
     fixed_x_mb, _ = next(iter(test_loader))
-    torch.manual_seed(0)
-    fixed_x_mb = (fixed_x_mb > torch.rand_like(fixed_x_mb)).float()
+
+    fixed_g = torch.Generator()
+    fixed_g.manual_seed(0)
+
+    r_fixed = torch.rand(fixed_x_mb.shape, generator=fixed_g)
+    fixed_x_mb = (fixed_x_mb > r_fixed).float()
+
 
     H_DIM = 128
     z_dim = int(config["z_dim"])
@@ -540,6 +568,25 @@ def run_sweep():
 
     print(f"\nDone. Saved: {out_csv}")
 
+def run_seed_robustness_only():
+    out_csv = "results_seed_robustness.csv"
+
+    seeds = [0, 1, 2, 3, 4]
+    epochs = 20
+    ds = "mnist"
+    z = 20
+
+    for seed in seeds:
+        run_one(
+            {"model_type": "vmf", "dataset": ds, "z_dim": z, "seed": seed,
+             "epochs": epochs, "kappa_clip": None, "kappa_temp": 1.0},
+            out_csv,
+        )
+
+    print("Seed robustness sweep done.")
+
 
 if __name__ == "__main__":
-    run_sweep()
+    run_sweep()                  # original experiments
+    run_seed_robustness_only()   # focused robustness check
+

@@ -44,8 +44,14 @@ class VonMisesFisher(torch.distributions.Distribution):
         self.last_mean_attempts = None
         self.last_num_proposals = None
         self.last_num_accepted = None
+        #added for logging per samples
+        self.last_attempts_per_sample = None
+        self.last_attempts_mean = None
+        self.last_attempts_p90 = None
+        self.last_attempts_max = None
 
-        super().__init__(self.loc.size(), validate_args=validate_args)
+        super().__init__(batch_shape=self.loc.shape[:-1], validate_args=validate_args)
+
 
     def sample(self, shape=torch.Size()):
         with torch.no_grad():
@@ -135,8 +141,10 @@ class VonMisesFisher(torch.distributions.Distribution):
         w = torch.zeros_like(b, device=self.device)
         e = torch.zeros_like(b, device=self.device)
         bool_mask = torch.ones_like(b, dtype=torch.bool, device=self.device)  # True = still needs accept
+        attempts = torch.zeros_like(b, dtype=torch.long, device=self.device)
 
-        # --- instrumentation counters ---
+
+        # instrumentation counters 
         total_proposals = 0
         total_accepted = 0
 
@@ -170,15 +178,28 @@ class VonMisesFisher(torch.distributions.Distribution):
             accept_mat = ((self.__m - 1.0) * t.log() - t + d) > torch.log(u)
             accept_idx = self.first_nonzero(accept_mat, dim=-1, invalid_val=-1).unsqueeze(1)  # (N,1)
 
+
             reject = accept_idx < 0     # (N,1)
             accept = ~reject            # (N,1)
+
+
+            # Everyone still active spent k proposals this round
+            attempts[bool_mask] += k
+
+            # Rows that accept in this round only spent (accept_idx + 1) proposals
+            accept_idx_clamped = accept_idx.clamp(min=0)
+            spent = (accept_idx_clamped + 1).to(attempts.dtype)
+
+            # We over-counted by (k - spent) for accepted rows, fixed it
+            attempts[bool_mask & accept] -= (k - spent)[bool_mask & accept]
+
 
             # pick first accepted proposal (or dummy index 0 if none)
             accept_idx_clamped = accept_idx.clamp(min=0)
             w_pick = w_mat.gather(1, accept_idx_clamped)
             e_pick = e_mat.gather(1, accept_idx_clamped)
 
-            # --- FIX: update using old mask, and advance the active set correctly ---
+            # FIX: update using old mask, and advance the active set correctly 
             bool_mask_old = bool_mask
             accepted_rows = bool_mask_old & accept
 
@@ -191,15 +212,24 @@ class VonMisesFisher(torch.distributions.Distribution):
             # still active iff it was active and it rejected this round
             bool_mask = bool_mask_old & reject
 
-        # --- save instrumentation on self ---
+        # save instrumentation on self 
         self.last_num_proposals = total_proposals
         self.last_num_accepted = total_accepted
         self.last_accept_rate = (total_accepted / float(total_proposals)) if total_proposals > 0 else None
         # unbiased mean attempts (proposals per accepted sample)
         self.last_mean_attempts = (total_proposals / float(total_accepted)) if total_accepted > 0 else None
 
-        return e.reshape(out_shape), w.reshape(out_shape)
 
+        # save instrumentation on self
+        self.last_attempts_per_sample = attempts.reshape(out_shape).detach()
+        flat = attempts.reshape(-1).float().detach()
+
+        self.last_attempts_mean = float(flat.mean().item())
+        self.last_attempts_p90  = float(torch.quantile(flat, 0.90).item())
+        self.last_attempts_max  = float(flat.max().item())
+
+        return e.reshape(out_shape), w.reshape(out_shape)
+    
     def __householder_rotation(self, x):
         u = self.__e1 - self.loc
         u = u / (u.norm(dim=-1, keepdim=True) + 1e-5)
