@@ -103,14 +103,6 @@ venv.bak/
 # mypy
 .mypy_cache/
 
-# Generated plots (keep scripts + CSVs, ignore images)
-results/plots_svae/
-results/**/*.png
-results/**/*.jpg
-results/**/*.jpeg
-results/**/*.pdf
-results/**/*.svg
-results/s-vae-pytorch/results/results_svae_sweep_MNIST_ONLY.csv
 # Logs
 run.log
 
